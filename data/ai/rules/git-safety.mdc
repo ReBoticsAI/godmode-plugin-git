@@ -1,0 +1,15 @@
+---
+description: Safe git usage via godmode-plugin-git tools for Intelligence
+alwaysApply: true
+---
+
+# Git safety (GodMode)
+
+When this plugin is installed, prefer **git_*** tools over inventing raw `run_terminal` git commands.
+
+- Inspect first: `git_status`, `git_diff`, `git_log`.
+- Mutate only with confirm tools: `git_add`, `git_commit`, `git_push`, `git_branch` (create/checkout), `git_pull`.
+- Never force-push, hard-reset, or `clean -fd` via this plugin (blocked) or via shell unless the user explicitly demands it and understands the risk.
+- Do not commit secrets (`.env`, API keys, passwords, ops scripts with credentials).
+- Do not use `--no-verify` / `skipHooks` unless the user explicitly asks.
+- Prefer focused pathspecs for `git_add` over staging the entire tree blindly.

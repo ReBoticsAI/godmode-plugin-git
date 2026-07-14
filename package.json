@@ -1,0 +1,12 @@
+{
+  "name": "@godmode-plugin/git",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Structured git tools for GodMode Intelligence (status, diff, commit, push).",
+  "scripts": {
+    "build": "echo Use GodMode build_plugin (Bridge esbuild) or npx esbuild locally"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
