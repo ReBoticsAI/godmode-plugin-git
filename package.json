@@ -5,8 +5,18 @@
   "type": "module",
   "description": "Structured git tools for GodMode Intelligence (status, diff, commit, push).",
   "scripts": {
-    "build": "echo Use GodMode build_plugin (Bridge esbuild) or npx esbuild locally"
+    "build": "esbuild src/bridge.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/bridge.js --external:@godmode/plugin-api --external:@godmode/kernel",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --no-file-parallelism",
+    "validate": "npm run typecheck && npm test && npm run build"
   },
   "dependencies": {},
-  "devDependencies": {}
+  "devDependencies": {
+    "@godmode/kernel": "file:../GodMode/packages/kernel",
+    "@godmode/plugin-api": "file:../GodMode/packages/plugin-api",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
 }
