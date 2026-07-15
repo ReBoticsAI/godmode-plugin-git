@@ -1,44 +1,191 @@
-import type { GodModePluginRegister } from "@godmode/plugin-api";
+import type {
+  GodModePluginRegister,
+  PluginKernelClient,
+  PluginRecordContext,
+  PluginToolHandler,
+} from "@godmode/plugin-api";
+import { KERNEL_CLIENT_API_VERSION } from "@godmode/plugin-api";
 import {
-  rejectDestructiveGitArgs,
+  parseBoolean,
+  parseLimit,
+  parsePath,
+  parseRevision,
   resolveWorkingRoot,
   runGit,
 } from "./git-util.js";
+import {
+  GIT_REPOSITORY_DEFINITION,
+  GIT_REPOSITORY_ID,
+  GIT_REPOSITORY_TYPE,
+  gitRepositoryAdapter,
+} from "./kernel.js";
 
-function str(v: unknown): string {
-  return typeof v === "string" ? v : "";
+const cwd = {
+  cwd: {
+    type: "string",
+    minLength: 1,
+    maxLength: 4_096,
+    description: "Directory within the tenant coding root",
+  },
+};
+
+function recordContext(
+  ctx: Parameters<PluginToolHandler>[1],
+  confirmationId?: string
+): PluginRecordContext {
+  return {
+    tenantId: ctx.tenantId,
+    userId: ctx.userId,
+    activeAgentId: ctx.activeAgentId ?? "godmode-plugin-git",
+    activeSubtaskCardId: ctx.activeSubtaskCardId,
+    activeTaskCardId: ctx.activeTaskCardId,
+    role: "intelligence",
+    source: "agent",
+    confirmationId,
+  };
 }
 
-function strList(v: unknown): string[] {
-  if (Array.isArray(v)) return v.map(String).filter(Boolean);
-  if (typeof v === "string" && v.trim()) {
-    return v.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+function confirmationId(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const value = error as {
+    status?: number;
+    code?: string;
+    details?: { confirmationId?: unknown };
+  };
+  if (
+    value.status !== 428 &&
+    value.code !== "KERNEL_CONFIRMATION_REQUIRED"
+  ) {
+    return undefined;
   }
-  return [];
+  return typeof value.details?.confirmationId === "string"
+    ? value.details.confirmationId
+    : undefined;
 }
+
+async function delegate(
+  kernel: PluginKernelClient,
+  action: string,
+  args: Record<string, unknown>,
+  ctx: Parameters<PluginToolHandler>[1]
+): Promise<unknown> {
+  try {
+    return await kernel.runAction(
+      GIT_REPOSITORY_TYPE,
+      action,
+      { ...args },
+      recordContext(ctx),
+      GIT_REPOSITORY_ID
+    );
+  } catch (error) {
+    // The compatibility tool has already passed its host confirmation gate.
+    const grant = confirmationId(error);
+    if (!grant) throw error;
+    return kernel.runAction(
+      GIT_REPOSITORY_TYPE,
+      action,
+      { ...args },
+      recordContext(ctx, grant),
+      GIT_REPOSITORY_ID
+    );
+  }
+}
+
+export function assertKernelClientVersion(
+  kernel: Pick<PluginKernelClient, "apiVersion">
+): void {
+  if (kernel.apiVersion !== KERNEL_CLIENT_API_VERSION) {
+    throw new Error(
+      `godmode-plugin-git requires kernel client API ${KERNEL_CLIENT_API_VERSION}; ` +
+        `host provided ${String(kernel.apiVersion)}`
+    );
+  }
+}
+
+const mutationTools = [
+  {
+    name: "git_branch",
+    action: "branch",
+    description: "Create and/or check out a branch through GitRepository.branch.",
+    properties: {
+      ...cwd,
+      name: { type: "string", minLength: 1, maxLength: 255 },
+      create: { type: "boolean", default: false },
+    },
+    required: ["name"],
+  },
+  {
+    name: "git_add",
+    action: "add",
+    description: "Stage bounded pathspecs through GitRepository.add.",
+    properties: {
+      ...cwd,
+      paths: {
+        type: "array",
+        minItems: 1,
+        maxItems: 500,
+        items: { type: "string", minLength: 1, maxLength: 1_024 },
+      },
+    },
+    required: ["paths"],
+  },
+  {
+    name: "git_commit",
+    action: "commit",
+    description: "Commit staged changes through GitRepository.commit.",
+    properties: {
+      ...cwd,
+      message: { type: "string", minLength: 1, maxLength: 10_000 },
+      skipHooks: { type: "boolean", default: false },
+    },
+    required: ["message"],
+  },
+  {
+    name: "git_push",
+    action: "push",
+    description: "Push without force through GitRepository.push.",
+    properties: {
+      ...cwd,
+      remote: { type: "string", minLength: 1, maxLength: 256, default: "origin" },
+      setUpstream: { type: "boolean", default: true },
+    },
+  },
+  {
+    name: "git_fetch",
+    action: "fetch",
+    description: "Fetch through the confirmed external GitRepository.fetch action.",
+    properties: {
+      ...cwd,
+      remote: { type: "string", minLength: 1, maxLength: 256 },
+    },
+  },
+  {
+    name: "git_pull",
+    action: "pull",
+    description: "Pull through GitRepository.pull with ff-only behavior by default.",
+    properties: {
+      ...cwd,
+      remote: { type: "string", minLength: 1, maxLength: 256 },
+      ffOnly: { type: "boolean", default: true },
+    },
+  },
+] as const;
 
 export const register: GodModePluginRegister = (api) => {
+  assertKernelClientVersion(api.kernel);
+  api.objectTypes.register(GIT_REPOSITORY_DEFINITION, gitRepositoryAdapter);
   api.tools.register([
     {
       name: "git_status",
-      description:
-        "Show git branch and porcelain status for the coding root (working tree).",
+      description: "Show branch and porcelain status inside the tenant coding root.",
       mode: "auto",
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: {
-            type: "string",
-            description: "Optional absolute working directory override",
-          },
-        },
-      },
+      parameters: { type: "object", properties: cwd, additionalProperties: false },
       handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const branch = await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
-        const status = await runGit(cwd, ["status", "--porcelain=v1", "-b"]);
+        const root = resolveWorkingRoot(ctx, args.cwd);
+        const branch = await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
+        const status = await runGit(root, ["status", "--porcelain=v1", "-b"]);
         return {
-          cwd,
+          cwd: root,
           branch: branch.stdout.trim(),
           status: status.stdout,
           code: status.code,
@@ -48,225 +195,101 @@ export const register: GodModePluginRegister = (api) => {
     },
     {
       name: "git_diff",
-      description:
-        "Show git diff. Use staged=true for --cached; or commit range via base/head.",
+      description: "Show staged, revision-range, or path-limited Git diff.",
       mode: "auto",
       parameters: {
         type: "object",
         properties: {
-          cwd: { type: "string" },
+          ...cwd,
           staged: { type: "boolean" },
-          base: { type: "string", description: "Compare base (e.g. main)" },
-          head: { type: "string", description: "Compare head (default HEAD)" },
-          pathspec: { type: "string" },
+          base: { type: "string", minLength: 1, maxLength: 4_096 },
+          head: { type: "string", minLength: 1, maxLength: 4_096 },
+          pathspec: { type: "string", minLength: 1, maxLength: 1_024 },
         },
+        additionalProperties: false,
       },
       handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
+        const root = resolveWorkingRoot(ctx, args.cwd);
         const gitArgs = ["diff"];
-        if (args.staged === true) gitArgs.push("--cached");
-        if (str(args.base)) {
-          gitArgs.push(`${str(args.base)}...${str(args.head) || "HEAD"}`);
+        if (parseBoolean(args.staged, "staged", false)) gitArgs.push("--cached");
+        if (args.base !== undefined) {
+          const base = parseRevision(args.base, "base");
+          const head =
+            args.head === undefined ? "HEAD" : parseRevision(args.head, "head");
+          gitArgs.push(`${base}...${head}`);
+        } else if (args.head !== undefined) {
+          throw Object.assign(new Error("head requires base"), {
+            status: 400,
+            code: "GIT_INVALID_ARGUMENT",
+          });
         }
-        if (str(args.pathspec)) gitArgs.push("--", str(args.pathspec));
-        const r = await runGit(cwd, gitArgs);
-        return { cwd, args: gitArgs, diff: r.stdout, code: r.code, stderr: r.stderr || undefined };
-      },
-    },
-    {
-      name: "git_log",
-      description: "Recent git log (oneline).",
-      mode: "auto",
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          limit: { type: "number", description: "Max commits (default 15)" },
-        },
-      },
-      handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const n = Math.min(50, Math.max(1, Number(args.limit ?? 15)));
-        const r = await runGit(cwd, ["log", `-n${n}`, "--oneline", "--decorate"]);
-        return { cwd, log: r.stdout, code: r.code, stderr: r.stderr || undefined };
-      },
-    },
-    {
-      name: "git_branches",
-      description: "List local git branches (verbose).",
-      mode: "auto",
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-        },
-      },
-      handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const r = await runGit(cwd, ["branch", "-vv"]);
-        return { cwd, branches: r.stdout, code: r.code };
-      },
-    },
-    {
-      name: "git_checkout",
-      description:
-        "Create and/or checkout a branch. Use create=true with name to make a new branch.",
-      mode: "confirm",
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          name: { type: "string", description: "Branch name" },
-          create: {
-            type: "boolean",
-            description: "If true, git checkout -b (create)",
-          },
-        },
-        required: ["name"],
-      },
-      handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const name = str(args.name);
-        if (!name) throw new Error("Branch name required");
-        const gitArgs =
-          args.create === true ? ["checkout", "-b", name] : ["checkout", name];
-        const r = await runGit(cwd, gitArgs);
-        if (r.code !== 0) throw new Error(r.stderr || r.stdout || "git checkout failed");
-        return { cwd, checkedOut: name, created: args.create === true, ok: true };
-      },
-    },
-    {
-      name: "git_add",
-      description: "Stage files (git add). Prefer pathspecs over bare '.' when possible.",
-      mode: "confirm",
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          paths: {
-            type: "array",
-            items: { type: "string" },
-            description: "Paths to stage",
-          },
-        },
-        required: ["paths"],
-      },
-      handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const paths = strList(args.paths);
-        if (!paths.length) throw new Error("paths required");
-        const r = await runGit(cwd, ["add", "--", ...paths]);
-        if (r.code !== 0) throw new Error(r.stderr || "git add failed");
-        return { cwd, staged: paths, ok: true };
-      },
-    },
-    {
-      name: "git_commit",
-      description:
-        "Commit staged changes. Does not amend; does not skip hooks unless skipHooks=true (confirm).",
-      mode: "confirm",
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          message: { type: "string", description: "Commit message (required)" },
-          skipHooks: {
-            type: "boolean",
-            description: "Pass --no-verify (discouraged)",
-          },
-        },
-        required: ["message"],
-      },
-      handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const message = str(args.message).trim();
-        if (!message) throw new Error("message required");
-        const gitArgs = ["commit", "-m", message];
-        if (args.skipHooks === true) gitArgs.push("--no-verify");
-        rejectDestructiveGitArgs(gitArgs);
-        const r = await runGit(cwd, gitArgs);
-        if (r.code !== 0) throw new Error(r.stderr || r.stdout || "git commit failed");
-        const head = await runGit(cwd, ["rev-parse", "HEAD"]);
+        if (args.pathspec !== undefined) gitArgs.push("--", parsePath(args.pathspec));
+        const result = await runGit(root, gitArgs);
         return {
-          cwd,
-          ok: true,
-          sha: head.stdout.trim(),
-          stdout: r.stdout,
+          cwd: root,
+          args: gitArgs,
+          diff: result.stdout,
+          code: result.code,
+          stderr: result.stderr || undefined,
         };
       },
     },
     {
-      name: "git_push",
-      description:
-        "Push current branch to remote (default origin, -u when needed). Force push is blocked.",
-      mode: "confirm",
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          remote: { type: "string", description: "Default origin" },
-          setUpstream: {
-            type: "boolean",
-            description: "Use -u (default true for new branches)",
-          },
-        },
-      },
-      handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const remote = str(args.remote) || "origin";
-        const branch = await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
-        const name = branch.stdout.trim();
-        if (!name || name === "HEAD") throw new Error("Detached HEAD — checkout a branch first");
-        const gitArgs = ["push"];
-        if (args.setUpstream !== false) gitArgs.push("-u");
-        gitArgs.push(remote, `HEAD:refs/heads/${name}`);
-        rejectDestructiveGitArgs(gitArgs);
-        const r = await runGit(cwd, gitArgs, { timeoutMs: 300_000 });
-        if (r.code !== 0) throw new Error(r.stderr || r.stdout || "git push failed");
-        return { cwd, ok: true, branch: name, remote, stdout: r.stdout, stderr: r.stderr };
-      },
-    },
-    {
-      name: "git_fetch",
-      description: "Fetch from remote(s).",
+      name: "git_log",
+      description: "Show a bounded number of recent commits.",
       mode: "auto",
       parameters: {
         type: "object",
         properties: {
-          cwd: { type: "string" },
-          remote: { type: "string" },
+          ...cwd,
+          limit: { type: "integer", minimum: 1, maximum: 50, default: 15 },
         },
+        additionalProperties: false,
       },
       handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const gitArgs = ["fetch"];
-        if (str(args.remote)) gitArgs.push(str(args.remote));
-        const r = await runGit(cwd, gitArgs, { timeoutMs: 300_000 });
-        return { cwd, ok: r.code === 0, stdout: r.stdout, stderr: r.stderr, code: r.code };
+        const root = resolveWorkingRoot(ctx, args.cwd);
+        const result = await runGit(root, [
+          "log",
+          `-n${parseLimit(args.limit)}`,
+          "--oneline",
+          "--decorate",
+        ]);
+        return {
+          cwd: root,
+          log: result.stdout,
+          code: result.code,
+          stderr: result.stderr || undefined,
+        };
       },
     },
     {
-      name: "git_pull",
-      description: "Pull with --ff-only by default (safe). Confirm required.",
-      mode: "confirm",
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          remote: { type: "string" },
-          ffOnly: { type: "boolean", description: "Default true" },
-        },
-      },
+      name: "git_branches",
+      description: "List local Git branches.",
+      mode: "auto",
+      parameters: { type: "object", properties: cwd, additionalProperties: false },
       handler: async (args, ctx) => {
-        const cwd = resolveWorkingRoot(ctx, args.cwd);
-        const gitArgs = ["pull"];
-        if (args.ffOnly !== false) gitArgs.push("--ff-only");
-        if (str(args.remote)) gitArgs.push(str(args.remote));
-        rejectDestructiveGitArgs(gitArgs);
-        const r = await runGit(cwd, gitArgs, { timeoutMs: 300_000 });
-        if (r.code !== 0) throw new Error(r.stderr || r.stdout || "git pull failed");
-        return { cwd, ok: true, stdout: r.stdout };
+        const root = resolveWorkingRoot(ctx, args.cwd);
+        const result = await runGit(root, ["branch", "-vv"]);
+        return {
+          cwd: root,
+          branches: result.stdout,
+          code: result.code,
+          stderr: result.stderr || undefined,
+        };
       },
     },
+    ...mutationTools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      mode: "confirm" as const,
+      parameters: {
+        type: "object",
+        properties: tool.properties,
+        required: "required" in tool ? [...tool.required] : undefined,
+        additionalProperties: false,
+      },
+      handler: ((args, ctx) =>
+        delegate(api.kernel, tool.action, args, ctx)) satisfies PluginToolHandler,
+    })),
   ]);
 };

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v4
+        with:
+          path: godmode-plugin-git
+      - name: Check out current GodMode API
+        uses: actions/checkout@v4
+        with:
+          repository: ReBoticsAI/GodMode
+          ref: 732d993808d641645ed706d8560719cba5349d6f
+          path: GodMode
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: godmode-plugin-git/package-lock.json
+      - name: Install GodMode workspace
+        run: npm ci
+        working-directory: GodMode
+      - name: Build current plugin API
+        run: npm run build -w @godmode/kernel && npm run build -w @godmode/plugin-api
+        working-directory: GodMode
+      - name: Install
+        run: npm ci
+        working-directory: godmode-plugin-git
+      - name: Validate
+        run: npm run validate
+        working-directory: godmode-plugin-git
